@@ -66,7 +66,7 @@ CloudFront 全球边缘节点共享同一批 IP 段，节点靠 TLS SNI 区分�
 
 - **链接缓存复用**：官网换链接口限流约 3 次/小时/IP，未过期的链接存 `~/.bmd/` 直接复用
 - **限流退避**：换链 403 自动指数退避重试，并提示等待窗口
-- **代理自动探测**：只用于访问官网 API（国内直连官网 API 会被劫持 301），依次尝试 `BMD_PROXY` → 直连 → 常见本地代理端口（7890/7897/10808/10809/1080）→ 环境变量代理；**下载文件本身永远直连 CDN**。所有 curl 均以 `--noproxy` 显式钉死代理行为，免疫 `NO_PROXY`/`https_proxy` 等代理环境变量干扰（注意 curl 的 `NO_PROXY` 优先级高于显式 `-x`，不钉死时设了 `NO_PROXY=*` 的 shell 里代理探测会全部静默失效）
+- **代理自动探测与路由**：只用于访问官网 API（实测 BMD **自家边缘**对大陆来源 IP 全站 301 强制降级 https→http——TLS 对端持 DigiCert 签发的 `*.blackmagicdesign.com` 真证书，并非运营商劫持；降级后 80 端口服务完好），依次尝试 `BMD_PROXY` → https 直连 → 常见本地代理端口（7890/7897/10808/10809/1080）→ 环境变量代理 → **http 明文直连回落**（无任何代理也能换链，打印告警并强制校验直链域名 `*.blackmagicdesign.com`）；**下载文件本身永远直连 CDN**。所有 curl 均以 `--noproxy` 显式钉死代理行为，免疫 `NO_PROXY`/`https_proxy` 等代理环境变量干扰（curl 的 `NO_PROXY` 优先级高于显式 `-x`，不钉死时设了 `NO_PROXY=*` 的 shell 里代理探测会全部静默失效）
 - **卡速自动换节点**：45 秒低于 100KB/s 判定卡速，自动轮换到下一个优选节点；连续 6 次断流自动重测优选
 
 ## 作为 AI Agent Skill 安装
@@ -98,6 +98,9 @@ git clone https://github.com/exitsys/bmd-download.git .agents/skills/bmd-downloa
 
 **Q: 校验失败怎么办？**
 删除残留的 zip 重跑，断点续传不会自动修复坏块。
+
+**Q: 没有代理能用吗？**
+能。海外/未被降级的网络直接 https 直连；国内无代理时自动回落 http 明文直连换链（BMD 对大陆 IP 强制降级，属官方边缘行为，非故障）。明文通道理论上可被篡改，脚本已强制校验返回直链的域名（`*.blackmagicdesign.com`）、下载完成后做 zip CRC 全量校验，并打印告警；该模式下签名直链按 http 协议签名、无法升级 https（改写协议即 404）。介意请配置 `BMD_PROXY`——有代理时换链走 https，下载文件本身则永远直连 CDN。
 
 **Q: 想下其它 Blackmagic 产品？**
 `latest-version` 接口按 product 查询，改 `get_link` 里的产品名（如 `davinci-resolve`）即可扩展。

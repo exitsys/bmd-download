@@ -47,46 +47,71 @@ bmd.sh — Blackmagic 官网大文件下载一体化工具 v1.0.0
 EOF
 }
 
-# ---------- 代理探测(只用于官网API; 下载文件永远直连) ----------
+# ---------- 代理探测与路由(只用于官网API; 下载文件永远直连) ----------
+# 路由 token: direct=https直连 | direct-http=http明文直连 | 其他=经该代理URL的https
 # curl 的 NO_PROXY 环境变量优先级高于显式 -x/--proxy: NO_PROXY=* 会把代理测试静默变直连;
 # 反之 https_proxy/ALL_PROXY 会让"必须直连"的请求静默走代理。所以每处 curl 都用
 # --noproxy 显式钉死: 带代理的请求用空列表(不排除任何主机), 直连的请求用 '*'(排除全部)。
-want_test() { # 参数为空=直连; 判定标准: latest-version 返回JSON(官网API直连在国内常被301劫持)
-  local np='*'; [ -n "${1:-}" ] && np=''
-  curl ${1:+-x "$1"} --noproxy "$np" -s --connect-timeout 8 -m 15 -A "$UA" \
-    -H 'Content-Type: application/json' -X POST "$API/api/support/latest-version" \
+# BMD 自家边缘(openresty, TLS对端持 DigiCert 签发的 *.blackmagicdesign.com 真证书)对大陆
+# 来源IP全站强制301降级https→http, 但80端口服务完好——无任何代理时回落 direct-http 换链。
+want_test() { # $1=路由token; 判定标准: latest-version 返回JSON
+  local base="https://www.blackmagicdesign.com" np='*' px=()
+  case "${1:-}" in
+    ""|direct) ;;
+    direct-http) base="http://www.blackmagicdesign.com" ;;
+    *) np=''; px=(-x "$1") ;;
+  esac
+  curl ${px[@]+"${px[@]}"} --noproxy "$np" -s --connect-timeout 8 -m 15 -A "$UA" \
+    -H 'Content-Type: application/json' -X POST "$base/api/support/latest-version" \
     -d '{"product":"davinci-resolve-studio","platform":"windows"}' 2>/dev/null \
     | grep -q '"downloadId"'
 }
-find_proxy() {
+find_proxy() { # → stdout: 路由token(direct|direct-http|代理URL); 全部候选失败输出空串
   local cached=""
   [ -s "$CACHE/proxy" ] && cached=$(cat "$CACHE/proxy")
-  [ "$cached" = "direct" ] && cached=""
   if [ -n "$cached" ] && want_test "$cached"; then echo "$cached"; return; fi
   local p
-  for p in "${BMD_PROXY:-}" "" "socks5h://127.0.0.1:7890" "socks5h://127.0.0.1:7897" \
+  for p in "${BMD_PROXY:-}" direct direct-http \
+           "socks5h://127.0.0.1:7890" "socks5h://127.0.0.1:7897" \
            "socks5h://127.0.0.1:10808" "socks5h://127.0.0.1:10809" "socks5h://127.0.0.1:1080" \
            "${ALL_PROXY:-}" "${https_proxy:-}"; do
-    if want_test "$p"; then echo "${p:-direct}" > "$CACHE/proxy"; echo "$p"; return; fi
+    [ -n "$p" ] || continue
+    if want_test "$p"; then echo "$p" > "$CACHE/proxy"; echo "$p"; return; fi
   done
   echo ""; return
 }
+set_route() { # $1=find_proxy输出的token → 设置 route_base/route_np/route_px; 空token返回1
+  route_base="https://www.blackmagicdesign.com"; route_np='*'; route_px=()
+  case "${1:-}" in
+    direct) ;;
+    direct-http)
+      route_base="http://www.blackmagicdesign.com"
+      if [ ! -f "$CACHE/http_warned" ]; then : > "$CACHE/http_warned"  # apicall常在$()子shell中执行, 变量防重不跨子shell, 用标志文件
+        log "⚠️ 无可用代理, 官网API回落 http 明文直连(BMD边缘对大陆IP强制301降级, 80端口服务完好)"
+        log "   明文通道理论上可被篡改, 已强制校验直链域名; 换到的http签名直链无法升级https(改写即404), 下载完成后zip CRC校验兜底; 建议配置 BMD_PROXY"
+      fi ;;
+    "") return 1 ;;
+    *) route_np=''; route_px=(-x "$1") ;;
+  esac
+  return 0
+}
 
-apicall() { # apicall <method> <path> [data]   (自动带代理/浏览器UA/会话cookie, 缺一样WAF就403)
+apicall() { # apicall <method> <path> [data]   (自动带路由/浏览器UA/会话cookie, 缺一样WAF就403)
   local p; p=$(find_proxy)
-  [ -z "$p" ] && { echo "PROXY_FAIL"; return; }
-  curl -x "$p" --noproxy '' -s --connect-timeout 15 -m 40 -A "$UA" -b "$CACHE/ck" \
+  set_route "$p" || { echo "PROXY_FAIL"; return; }
+  curl ${route_px[@]+"${route_px[@]}"} --noproxy "$route_np" -s --connect-timeout 15 -m 40 -A "$UA" -b "$CACHE/ck" \
     -H 'Content-Type: application/json;charset=UTF-8' \
     -H 'Accept: application/json, text/plain, */*' \
-    -H "Origin: $API" -H "Referer: $API/products/davinciresolve/download" \
-    -H 'X-Requested-With: XMLHttpRequest' -X "$1" "$API$2" ${3:+-d "$3"}
+    -H "Origin: $route_base" -H "Referer: $route_base/products/davinciresolve/download" \
+    -H 'X-Requested-With: XMLHttpRequest' -X "$1" "$route_base$2" ${3:+-d "$3"}
 }
 
 sess() { # 官网WAF要求: POST register 前先访问页面拿会话cookie
   local p; p=$(find_proxy)
-  [ -z "$p" ] && return 1
-  curl -x "$p" --noproxy '' -s -c "$CACHE/ck" --connect-timeout 15 -A "$UA" \
-    "$API/products/davinciresolve/download" -o /dev/null
+  set_route "$p" || return 1
+  [ "$p" = "direct-http" ] && rm -f "$CACHE/ck"  # 旧jar中Secure标记的cookie不会随http发送, 重建
+  curl ${route_px[@]+"${route_px[@]}"} --noproxy "$route_np" -s -c "$CACHE/ck" --connect-timeout 15 -A "$UA" \
+    "$route_base/products/davinciresolve/download" -o /dev/null
 }
 
 # ---------- 换直链(带缓存+限流退避) ----------
@@ -112,7 +137,13 @@ get_link() { # get_link <studio|free> <platform>  → stdout: URL
   for i in 1 2 3; do
     sess
     u=$(apicall POST "/api/register/us/download/$did" '{"country":"US","origin":"www.blackmagicdesign.com"}')
-    if echo "$u" | grep -q '^https'; then echo "$u" > "$f"; echo "$u"; return; fi
+    if echo "$u" | grep -q '^https\?://'; then
+      # http路由下register回显http签名直链: CloudFront签名按协议生成, 改写成https会404(实测), 只能原样使用
+      case "$u" in  # http明文路由下换链响应可能被篡改, 强制校验直链域名
+        https://*.blackmagicdesign.com/*|http://*.blackmagicdesign.com/*) ;;
+        *) log "换链返回的直链域名异常, 拒绝使用: $(echo "$u" | head -c 60)"; return 1 ;;
+      esac
+      echo "$u" > "$f"; echo "$u"; return; fi
     if echo "$u" | grep -q 'Must register'; then
       log "免费版需要完整注册表单, 本脚本只支持 Studio 免表单流程; 免费版请去官网页面下载"; return 1
     fi

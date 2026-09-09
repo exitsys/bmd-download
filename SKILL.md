@@ -44,7 +44,7 @@ bash scripts/bmd.sh probe --quick      # 只重测已知节点, 约3分钟
 | 直链"过期" | CloudFront 签名 URL 寿命约 2h50m，重新生成即可，不限次数 |
 | 换链接接口 403 | 每个 IP 每小时限约 3 次；脚本缓存未过期链接、自动退避重试 |
 | API 必须带浏览器 UA + 先访问页面拿 cookie | WAF 规则，缺一个就 403/400，脚本已内置 |
-| 官网 API 要代理、下载不要代理 | 国内直连官网 API 会被 openresty 301 劫持；下载文件必须直连 CloudFront（走代理必慢必断）。脚本自动探测代理（env `BMD_PROXY` 可指定，如 `socks5h://127.0.0.1:10808`） |
+| 官网 API 要代理、下载不要代理 | BMD 自家边缘（openresty，真证书可证并非运营商劫持）对大陆 IP 全站 301 降级 https→http，80 端口服务完好；下载文件必须直连 CloudFront（走代理必慢必断）。脚本自动探测代理（env `BMD_PROXY` 可指定，如 `socks5h://127.0.0.1:10808`）；完全无代理时自动回落 http 明文换链（带告警+直链域名校验） |
 | 默认 DNS 节点晚高峰可能堵到 <50KB/s | 优选后同文件可达 16-19 MB/s；结果存 `~/.bmd/ips.txt`，超 12 小时自动重测 |
 | CF 中国网段(120.52.x/180.163.x/111.13.x) | 只服务有 ICP 备案的站，BMD 没备案，连了 403，脚本已排除 |
 | 172.64.x.x 等 Cloudflare IP | 服务不了 CloudFront 的域名（证书不匹配），别拿来优选 BMD |
@@ -59,7 +59,7 @@ bash scripts/bmd.sh probe --quick      # 只重测已知节点, 约3分钟
 
 ## 环境要求
 
-Git Bash (Windows) 或 Linux/macOS；curl、python/python3。代理自动探测顺序：`BMD_PROXY` env → 直连测试 → 127.0.0.1 常见端口 (7890/7897/10808/10809/1080) → `ALL_PROXY`/`https_proxy` env。海外服务器直连即可，脚本探测会自动跳过代理。脚本所有 curl 均用 `--noproxy` 显式钉死代理行为，`NO_PROXY=*` 或全局 `https_proxy` 等环境变量不会造成干扰。
+Git Bash (Windows) 或 Linux/macOS；curl、python/python3。代理自动探测顺序：`BMD_PROXY` env → https 直连 → 127.0.0.1 常见端口 (7890/7897/10808/10809/1080) → `ALL_PROXY`/`https_proxy` env → http 明文直连回落（BMD 边缘对大陆 IP 强制 301 降级，80 端口完好；换链结果强制校验 `*.blackmagicdesign.com` 域名）。海外服务器直连即可，脚本探测会自动跳过代理。脚本所有 curl 均用 `--noproxy` 显式钉死代理行为，`NO_PROXY=*` 或全局 `https_proxy` 等环境变量不会造成干扰。
 
 ## 失败排查
 

@@ -48,8 +48,12 @@ EOF
 }
 
 # ---------- 代理探测(只用于官网API; 下载文件永远直连) ----------
+# curl 的 NO_PROXY 环境变量优先级高于显式 -x/--proxy: NO_PROXY=* 会把代理测试静默变直连;
+# 反之 https_proxy/ALL_PROXY 会让"必须直连"的请求静默走代理。所以每处 curl 都用
+# --noproxy 显式钉死: 带代理的请求用空列表(不排除任何主机), 直连的请求用 '*'(排除全部)。
 want_test() { # 参数为空=直连; 判定标准: latest-version 返回JSON(官网API直连在国内常被301劫持)
-  curl ${1:+-x "$1"} -s --connect-timeout 8 -m 15 -A "$UA" \
+  local np='*'; [ -n "${1:-}" ] && np=''
+  curl ${1:+-x "$1"} --noproxy "$np" -s --connect-timeout 8 -m 15 -A "$UA" \
     -H 'Content-Type: application/json' -X POST "$API/api/support/latest-version" \
     -d '{"product":"davinci-resolve-studio","platform":"windows"}' 2>/dev/null \
     | grep -q '"downloadId"'
@@ -71,7 +75,7 @@ find_proxy() {
 apicall() { # apicall <method> <path> [data]   (自动带代理/浏览器UA/会话cookie, 缺一样WAF就403)
   local p; p=$(find_proxy)
   [ -z "$p" ] && { echo "PROXY_FAIL"; return; }
-  curl -x "$p" -s --connect-timeout 15 -m 40 -A "$UA" -b "$CACHE/ck" \
+  curl -x "$p" --noproxy '' -s --connect-timeout 15 -m 40 -A "$UA" -b "$CACHE/ck" \
     -H 'Content-Type: application/json;charset=UTF-8' \
     -H 'Accept: application/json, text/plain, */*' \
     -H "Origin: $API" -H "Referer: $API/products/davinciresolve/download" \
@@ -81,7 +85,7 @@ apicall() { # apicall <method> <path> [data]   (自动带代理/浏览器UA/会�
 sess() { # 官网WAF要求: POST register 前先访问页面拿会话cookie
   local p; p=$(find_proxy)
   [ -z "$p" ] && return 1
-  curl -x "$p" -s -c "$CACHE/ck" --connect-timeout 15 -A "$UA" \
+  curl -x "$p" --noproxy '' -s -c "$CACHE/ck" --connect-timeout 15 -A "$UA" \
     "$API/products/davinciresolve/download" -o /dev/null
 }
 
@@ -129,7 +133,7 @@ edges_fresh() { # ~/.bmd/ips.txt 存在、有可用节点且 <12h → 真
 probe() { # probe [--quick]  → ~/.bmd/ips.txt (IP 速度B/s 按降序; 首行 # 时间戳 日期)
   local quick=false; [ "${1:-}" = "--quick" ] && quick=true
   local url; url=$(get_link studio windows) || return 1
-  curl -s --connect-timeout 10 "https://d7uri8nf7uskq.cloudfront.net/tools/list-cloudfront-ips" -o "$CACHE/cfips.json" \
+  curl -s --noproxy '*' --connect-timeout 10 "https://d7uri8nf7uskq.cloudfront.net/tools/list-cloudfront-ips" -o "$CACHE/cfips.json" \
     || { log "拉取 CloudFront IP 列表失败"; return 1; }
   "$PY" -c "
 import json, sys, ipaddress
@@ -147,7 +151,7 @@ print('\n'.join(ips))" "$CACHE/cfips.json" | tr -d '\r' > "$CACHE/cand.txt"  # W
   if $quick && [ -s "$CACHE/ips.txt" ]; then  # quick: 只重测上次的可用节点
     awk '!/^#/{print $1}' "$CACHE/ips.txt" > "$CACHE/cand.txt"
   fi
-  local len off; len=$(curl -sI --connect-timeout 15 -A "$UA" "$url" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')
+  local len off; len=$(curl -sI --noproxy '*' --connect-timeout 15 -A "$UA" "$url" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')
   off=$(( ${len:-9600000000} / 2 ))   # 文件中部冷数据, 对所有节点公平
   log "开始测速: $(wc -l < "$CACHE/cand.txt") 个节点 × 2MB, 每节点最多8秒..."
   : > "$CACHE/ips.raw"
@@ -155,7 +159,7 @@ print('\n'.join(ips))" "$CACHE/cfips.json" | tr -d '\r' > "$CACHE/cand.txt"  # W
   while read -r ip; do
     ip=${ip%$'\r'}   # 双保险: 兜底剥掉可能残留的CR
     n=$((n+1))
-    r=$(curl -s --resolve "$DLHOST:443:$ip" -r $off-$((off+2097151)) -o /dev/null \
+    r=$(curl -s --noproxy '*' --resolve "$DLHOST:443:$ip" -r $off-$((off+2097151)) -o /dev/null \
         -w '%{http_code} %{speed_download}' --max-time 8 -A "$UA" "$url" 2>/dev/null)
     echo "$ip $r" >> "$CACHE/ips.raw"
     [ $((n % 10)) -eq 0 ] && log "  已测 $n/$total"
@@ -174,7 +178,7 @@ cmd_download() { # download <studio|free> <platform> [outdir] [--no-probe]
   mkdir -p "$outdir" || return 1
   local url; url=$(get_link "$key" "$plat") || return 1
   local fname; fname=$(basename "${url%%\?*}")
-  local expected; expected=$(curl -sI --connect-timeout 15 -A "$UA" "$url" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')
+  local expected; expected=$(curl -sI --noproxy '*' --connect-timeout 15 -A "$UA" "$url" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')
   [ -n "${BMD_LIMIT:-}" ] && expected=$BMD_LIMIT   # 测试模式: 只下前N字节
   [ -n "$expected" ] || { log "HEAD 获取大小失败"; return 1; }
   log "文件: $fname  大小: $expected 字节  保存到: $outdir"
@@ -216,7 +220,7 @@ print('CRC_OK' if bad is None else 'CRC_BAD:'+bad)")
     [ -n "${BMD_LIMIT:-}" ] && range=(-r 0-$((BMD_LIMIT-1)))   # 测试模式: 只要前N字节
     [ ${#edges[@]} -gt 0 ] && res=(--resolve "$DLHOST:443:${edges[$ei]}")
     log "try=$tries 已下 $((size/1024/1024))MB/$((expected/1024/1024))MB ($(awk "BEGIN{printf \"%.1f%%\", $size*100/$expected}")) 节点=${edges[$ei]:-默认DNS}"
-    local http; http=$(curl -sfL "${range[@]}" -o "$outdir/$fname" --connect-timeout 15 \
+    local http; http=$(curl -sfL --noproxy '*' "${range[@]}" -o "$outdir/$fname" --connect-timeout 15 \
         --speed-time 45 --speed-limit 102400 -A "$UA" ${res[@]+"${res[@]}"} \
         -w '%{http_code}' "$url" 2>/dev/null)
     local rc=$?
@@ -245,7 +249,7 @@ print('CRC_OK' if bad is None else 'CRC_BAD:'+bad)")
 cmd_link() { # link <studio|free> <platform>
   local url; url=$(get_link "$1" "$2") || return 1
   local exp; exp=$(echo "$url" | sed 's/.*Expires=//' | tr -dc '0-9')
-  local len; len=$(curl -sI --connect-timeout 15 -A "$UA" "$url" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')
+  local len; len=$(curl -sI --noproxy '*' --connect-timeout 15 -A "$UA" "$url" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')
   echo "文件: $(basename "${url%%\?*}")"
   echo "大小: ${len:-?} 字节"
   echo "有效期至: $("$PY" -c "import time;print(time.strftime('%F %T', time.localtime($exp)))") (剩 $(( (exp-$(date +%s))/60 )) 分钟)"

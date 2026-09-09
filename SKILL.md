@@ -59,7 +59,7 @@ bash scripts/bmd.sh probe --quick      # 只重测已知节点, 约3分钟
 
 ## 环境要求
 
-Git Bash (Windows) 或 Linux/macOS；curl、python/python3。代理自动探测顺序：`BMD_PROXY` env → 直连测试 → 127.0.0.1 常见端口 (7890/7897/10808/10809/1080) → `ALL_PROXY`/`https_proxy` env。海外服务器直连即可，脚本探测会自动跳过代理。
+Git Bash (Windows) 或 Linux/macOS；curl、python/python3。代理自动探测顺序：`BMD_PROXY` env → 直连测试 → 127.0.0.1 常见端口 (7890/7897/10808/10809/1080) → `ALL_PROXY`/`https_proxy` env。海外服务器直连即可，脚本探测会自动跳过代理。脚本所有 curl 均用 `--noproxy` 显式钉死代理行为，`NO_PROXY=*` 或全局 `https_proxy` 等环境变量不会造成干扰。
 
 ## 失败排查
 

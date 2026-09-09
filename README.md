@@ -35,12 +35,12 @@ bash scripts/bmd.sh download studio windows
 # 其他常用法
 bash scripts/bmd.sh link studio windows     # 只拿直链(打印URL/大小/有效期), 可粘到 IDM/浏览器
 bash scripts/bmd.sh link studio mac         # macOS 版
-bash scripts/bmd.sh probe                   # CloudFront 全网段优选测速(约10-15分钟)
-bash scripts/bmd.sh probe --quick           # 只重测已知可用节点(约3分钟)
+bash scripts/bmd.sh probe                   # CloudFront 优选测速(两段并行约1-3分钟)
+bash scripts/bmd.sh probe --quick           # 只重测已知可用节点(约半分钟)
 bash scripts/bmd.sh help                    # 完整帮助
 ```
 
-`download` 一条命令到底：查最新版本 → 换直链 → 优选节点（结果缓存 12 小时）→ 断点续传 → 链接过期自动换 → 速度不佳自动轮换节点 → 下载完成自动做 zip CRC 校验。中断后**重跑同一条命令即续传**。
+`download` 一条命令到底：查最新版本 → 换直链 → 优选节点（两段并行约 1-3 分钟，结果缓存 12 小时；API 可 https 直连的海外型网络自动跳过，`--probe` 可强制）→ 断点续传 → 链接过期自动换 → 速度不佳自动轮换节点 → 下载完成自动做 zip CRC 校验。中断后**重跑同一条命令即续传**。
 
 ## 工作原理
 
@@ -58,7 +58,7 @@ POST /api/register/us/download/<downloadId>         → 返回 CloudFront 签名
 
 ### 2. CloudFront 优选
 
-CloudFront 全球边缘节点共享同一批 IP 段，节点靠 TLS SNI 区分服务哪个域名——**任何边缘 IP 都能服务任何 CloudFront 站点**。脚本拉取 AWS 官方 IP 清单（排除只服务 ICP 备案站的中国网段），对每个网段实测 2MB Range 下载速度，取最快的节点用 `--resolve` 固定下载。
+CloudFront 全球边缘节点共享同一批 IP 段，节点靠 TLS SNI 区分服务哪个域名——**任何边缘 IP 都能服务任何 CloudFront 站点**。脚本拉取 AWS 官方 IP 清单（排除只服务 ICP 备案站的中国网段），**两段并行测速**：先对每个网段用 1MB 样本并发粗筛（留下"通且不龟速"的），再对前 16 名用 8MB 样本并发精测定排名，取最快的节点用 `--resolve` 固定下载。
 
 同一批优选结果对**所有** CloudFront 站点通用（如 AWS 官方静态资源）。注意与 Cloudflare 的优选 IP 池互不通用。
 
@@ -67,7 +67,7 @@ CloudFront 全球边缘节点共享同一批 IP 段，节点靠 TLS SNI 区分�
 - **链接缓存复用**：官网换链接口限流约 3 次/小时/IP，未过期的链接存 `~/.bmd/` 直接复用
 - **限流退避**：换链 403 自动指数退避重试，并提示等待窗口
 - **代理自动探测与路由**：只用于访问官网 API（实测 BMD **自家边缘**对大陆来源 IP 全站 301 强制降级 https→http——TLS 对端持 DigiCert 签发的 `*.blackmagicdesign.com` 真证书，并非运营商劫持；降级后 80 端口服务完好），依次尝试 `BMD_PROXY` → https 直连 → 常见本地代理端口（7890/7897/10808/10809/1080）→ 环境变量代理 → **http 明文直连回落**（无任何代理也能换链，打印告警并强制校验直链域名 `*.blackmagicdesign.com`）；**下载文件本身永远直连 CDN**。所有 curl 均以 `--noproxy` 显式钉死代理行为，免疫 `NO_PROXY`/`https_proxy` 等代理环境变量干扰（curl 的 `NO_PROXY` 优先级高于显式 `-x`，不钉死时设了 `NO_PROXY=*` 的 shell 里代理探测会全部静默失效）
-- **卡速自动换节点**：45 秒低于 100KB/s 判定卡速，自动轮换到下一个优选节点；连续 6 次断流自动重测优选
+- **卡速自动换节点**：45 秒低于 100KB/s 判定卡速，自动轮换到下一个优选节点；连续断流自动重测优选（手里没有优选节点时 2 次即触发）；API 可 https 直连（海外型）的网络默认跳过前置优选，`download --probe` 可强制
 
 ## 作为 AI Agent Skill 安装
 

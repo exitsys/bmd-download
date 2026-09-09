@@ -32,11 +32,13 @@ bmd.sh — Blackmagic 官网大文件下载一体化工具 v1.0.0
 用法:
   bmd.sh link <studio|free> <windows|winarm|mac|linux>
       查最新版本并换取直链, 打印 URL/大小/有效期 (可粘到 IDM/FDM/浏览器)
-  bmd.sh download <studio|free> <windows|winarm|mac|linux> [保存目录] [--no-probe]
+  bmd.sh download <studio|free> <windows|winarm|mac|linux> [保存目录] [--no-probe|--probe]
       全自动下载: 换链 → 优选节点 → 断点续传 → 自动换链/换节点 → zip CRC 校验
       --no-probe  跳过优选测速, 用默认 DNS
+      --probe     强制重新优选(忽略缓存; 海外直连型网络默认跳过优选, 用它强制)
   bmd.sh probe [--quick]
-      CloudFront 全网段优选测速(全量约10-15分钟, --quick 只重测已知节点约3分钟)
+      CloudFront 优选测速, 两段并行(粗筛1MB×并发8 → 前16精测8MB×并发4)
+      全量约1-3分钟, --quick 只重测已知节点约半分钟
       结果存 ~/.bmd/ips.txt, 12小时内自动复用
 
 环境变量:
@@ -161,7 +163,14 @@ edges_fresh() { # ~/.bmd/ips.txt 存在、有可用节点且 <12h → 真
   [ -n "$ts" ] && [ $(( $(date +%s) - ts )) -lt 43200 ]
 }
 
-probe() { # probe [--quick]  → ~/.bmd/ips.txt (IP 速度B/s 按降序; 首行 # 时间戳 日期)
+probe_one() { # $1=IP $2=样本字节 $3=最长秒 $4=结果文件 → 追加 "ip code speed" 行(并发调用)
+  local r
+  r=$(curl -s --noproxy '*' --resolve "$DLHOST:443:$1" -r $POFF-$((POFF+$2-1)) -o /dev/null \
+      -w '%{http_code} %{speed_download}' --max-time "$3" -A "$UA" "$PURL" 2>/dev/null)
+  echo "$1 $r" >> "$4"
+}
+
+probe() { # probe [--quick]  → ~/.bmd/ips.txt (两段并行: 粗筛1MB×并发8 → 前16精测8MB×并发4)
   local quick=false; [ "${1:-}" = "--quick" ] && quick=true
   local url; url=$(get_link studio windows) || return 1
   curl -s --noproxy '*' --connect-timeout 10 "https://d7uri8nf7uskq.cloudfront.net/tools/list-cloudfront-ips" -o "$CACHE/cfips.json" \
@@ -184,28 +193,51 @@ print('\n'.join(ips))" "$CACHE/cfips.json" | tr -d '\r' > "$CACHE/cand.txt"  # W
   fi
   local len off; len=$(curl -sI --noproxy '*' --connect-timeout 15 -A "$UA" "$url" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')
   off=$(( ${len:-9600000000} / 2 ))   # 文件中部冷数据, 对所有节点公平
-  log "开始测速: $(wc -l < "$CACHE/cand.txt") 个节点 × 2MB, 每节点最多8秒..."
+  PURL="$url"; POFF=$off   # 供 probe_one(后台子进程)使用
+  local total ip pids=()
+  total=$(wc -l < "$CACHE/cand.txt")
+
+  # ---- 第1段: 并行粗筛, 目标是"通且不龟速"(206 且 ≥256KB/s), 排名仅作精测入场券 ----
+  log "粗筛 $total 个节点: 每节点1MB样本/最长5秒, 并发8..."
   : > "$CACHE/ips.raw"
-  local n=0 total r; total=$(wc -l < "$CACHE/cand.txt")
   while read -r ip; do
-    ip=${ip%$'\r'}   # 双保险: 兜底剥掉可能残留的CR
-    n=$((n+1))
-    r=$(curl -s --noproxy '*' --resolve "$DLHOST:443:$ip" -r $off-$((off+2097151)) -o /dev/null \
-        -w '%{http_code} %{speed_download}' --max-time 8 -A "$UA" "$url" 2>/dev/null)
-    echo "$ip $r" >> "$CACHE/ips.raw"
-    [ $((n % 10)) -eq 0 ] && log "  已测 $n/$total"
+    ip=${ip%$'\r'}; [ -n "$ip" ] || continue   # 双保险: 兜底剥掉可能残留的CR
+    probe_one "$ip" 1048576 5 "$CACHE/ips.raw" &
+    pids+=($!)
+    [ ${#pids[@]} -lt 8 ] || { wait "${pids[@]}"; pids=(); }
   done < "$CACHE/cand.txt"
+  [ ${#pids[@]} -gt 0 ] && wait "${pids[@]}"
+  local survivors; survivors=$(awk '$2==206 && $3>=262144 {print $1, $3}' "$CACHE/ips.raw" | sort -k2 -rn | head -16 | awk '{print $1}')
+  log "粗筛完成: 存活 $(echo "$survivors" | grep -c .) 个"
+
+  # ---- 第2段: 并行精测前16, 大样本定排名; 全军覆没则退回粗筛结果 ----
+  local src="$CACHE/ips.raw"
+  if [ -n "$survivors" ]; then
+    log "精测存活前16: 每节点8MB样本/最长8秒, 并发4..."
+    : > "$CACHE/ips2.raw"
+    pids=()
+    for ip in $survivors; do
+      probe_one "$ip" 8388608 8 "$CACHE/ips2.raw" &
+      pids+=($!)
+      [ ${#pids[@]} -lt 4 ] || { wait "${pids[@]}"; pids=(); }
+    done
+    [ ${#pids[@]} -gt 0 ] && wait "${pids[@]}"
+    awk '$2==206 && $3>0' "$CACHE/ips2.raw" | grep -q . && src="$CACHE/ips2.raw"
+  fi
   awk -v ts="$(date +%s)" -v d="$(date '+%F %T')" \
-      'BEGIN{print "# "ts" "d} $2==206 && $3>0 {print $1, $3}' "$CACHE/ips.raw" | sort -k2 -rn > "$CACHE/ips.txt"
+      'BEGIN{print "# "ts" "d} $2==206 && $3>0 {print $1, $3}' "$src" | sort -k2 -rn > "$CACHE/ips.txt"
   log "优选完成, 可用节点 $(($(wc -l < "$CACHE/ips.txt")-1)) 个, Top5:"
   sed -n '2,6p' "$CACHE/ips.txt" | awk '{printf "  %-16s %6.2f MB/s\n", $1, $2/1048576}'
 }
 
 # ---------- 下载 ----------
-cmd_download() { # download <studio|free> <platform> [outdir] [--no-probe]
-  local key=$1 plat=$2 outdir="." noprobe=false a
+cmd_download() { # download <studio|free> <platform> [outdir] [--no-probe|--probe]
+  local key=$1 plat=$2 outdir="." noprobe=false forceprobe=false a
   shift 2
-  for a in "$@"; do case "$a" in --no-probe) noprobe=true ;; *) outdir="$a" ;; esac; done
+  for a in "$@"; do case "$a" in --no-probe) noprobe=true ;; --probe) forceprobe=true ;; *) outdir="$a" ;; esac; done
+  # Git Bash 下 "D:/中文目录" 风格路径: MSYS stat 可能拿不到大小, 续传判断失效会从0重写文件
+  # (实测踩坑)。统一转成 /d/... MSYS 风格, stat 与 原生curl(经MSYS参数转换) 都能正确处理。
+  case "$outdir" in [A-Za-z]:[/\\]*) command -v cygpath >/dev/null 2>&1 && outdir=$(cygpath -u "$outdir") ;; esac
   mkdir -p "$outdir" || return 1
   local url; url=$(get_link "$key" "$plat") || return 1
   local fname; fname=$(basename "${url%%\?*}")
@@ -215,11 +247,16 @@ cmd_download() { # download <studio|free> <platform> [outdir] [--no-probe]
   log "文件: $fname  大小: $expected 字节  保存到: $outdir"
 
   if ! $noprobe; then
-    if ! edges_fresh; then
-      log "无近期(<12h)优选结果, 先测速(全量约10-15分钟; 急用可 Ctrl+C 改用 --no-probe)"
+    local route; route=$(cat "$CACHE/proxy" 2>/dev/null)   # get_link 刚刷新过的 API 路由
+    if $forceprobe; then
       probe || log "测速失败, 回退默认DNS"
-    else
+    elif [ "$route" = "direct" ]; then
+      log "API 可 https 直达(海外型网络), 跳过前置优选; 默认DNS不佳时会在卡速后自动触发测速"
+    elif edges_fresh; then
       log "用近期优选缓存, 最快节点: $(awk 'NR==2{print $1" ("int($2/1048576*100)/100" MB/s)"}' "$CACHE/ips.txt")"
+    else
+      log "无近期(<12h)优选结果, 先两段并行测速(约1-3分钟)..."
+      probe || log "测速失败, 回退默认DNS"
     fi
   fi
   local edges=(); load_edges edges
@@ -265,8 +302,9 @@ print('CRC_OK' if bad is None else 'CRC_BAD:'+bad)")
       if [ ${#edges[@]} -gt 1 ]; then
         ei=$(( (ei+1) % ${#edges[@]} )); log "速度不佳, 切换节点 → ${edges[$ei]} (第${stall}次)"
       fi
-      if [ $stall -ge 6 ]; then
-        log "连续6次断流, 重测优选..."
+      local rth=6; [ ${#edges[@]} -eq 0 ] && rth=2   # 手里没有优选节点时更早触发重测
+      if [ $stall -ge $rth ]; then
+        log "连续${stall}次断流, 重测优选..."
         probe && load_edges edges
         ei=0; stall=0
       fi

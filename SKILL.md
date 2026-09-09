@@ -1,6 +1,6 @@
 ---
 name: bmd-download
-description: 下载 Blackmagic 官网大文件（DaVinci Resolve / DaVinci Resolve Studio 等），解决国内网络下载官网安装包报 "This URL is invalid or has expired"、完全无法下载的问题，以及大文件下载中断、晚高峰速度极慢的问题。只要用户提到达芬奇、DaVinci Resolve、Blackmagic 下载安装包、官网下载链接失效过期报错、下载九个G大文件、CloudFront 优选 IP / 边缘节点测速，就用本 skill。核心能力：官网 API 自动换最新签名直链（Studio 版 Download Only 同款流程）、直连 CloudFront 断点续传、链接失效自动重换、全网段优选 IP 自动测速与自动切换。
+description: 下载 Blackmagic 官网大文件（DaVinci Resolve / Studio / Desktop Video 驱动 / 相机固件 / Fusion / ATEM / 各类 SDK 等 BMD 全系 39 条产品线），解决国内网络下载官网安装包报 "This URL is invalid or has expired"、完全无法下载的问题，以及大文件下载中断、晚高峰速度极慢的问题。只要用户提到达芬奇、DaVinci Resolve、Blackmagic 任何软件/驱动/固件下载、官网下载链接失效过期报错、下载九个G大文件、CloudFront 优选 IP / 边缘节点测速，就用本 skill。核心能力：官网 API 自动换最新签名直链（免表单项通用）、官网全目录任意产品任意历史版本、直连 CloudFront 断点续传、链接失效自动重换、全网段优选 IP 自动测速与自动切换。
 ---
 
 # BMD Download — Blackmagic 官网大文件下载
@@ -14,6 +14,7 @@ bash scripts/bmd.sh <子命令>
 ## 什么时候用
 
 - 用户要下载 DaVinci Resolve / Studio 安装包（任何版本，脚本自动查最新）
+- 用户要下载任何 BMD 软件：Desktop Video 驱动、相机固件、Fusion Studio、ATEM、HyperDeck、各类 SDK（`list` 列全部 39 条产品线，`versions` 查版本历史，支持指定历史版本回退）
 - 用户报官网下载跳转报错 **"This URL is invalid or has expired"**、完全无法下载 —— 官网直链是短时效签名 URL，浏览器换链流程在国内网络经常走不通；本 skill 现场换新鲜直链直连下载
 - 用户报大文件下载中途断了要重头再来 —— 断点续传，重跑同命令接着下
 - 用户要"优选 IP / 测速 CloudFront 节点"
@@ -29,6 +30,12 @@ bash scripts/bmd.sh link free windows
 bash scripts/bmd.sh download studio windows            # 下载到当前目录
 bash scripts/bmd.sh download studio windows --no-probe # 跳过优选, 用默认DNS
 bash scripts/bmd.sh download studio mac /保存目录       # 第3参数=保存目录
+
+# BMD 全系软件 (官网全目录: 驱动/固件/Fusion/ATEM/SDK 等)
+bash scripts/bmd.sh list                             # 列产品线
+bash scripts/bmd.sh versions desktop-video windows   # 查版本历史(新到旧)
+bash scripts/bmd.sh download desktop-video windows   # 下最新版
+bash scripts/bmd.sh download desktop-video@16.3 windows  # 指定历史版本
 
 # 优选 IP 测速（存 ~/.bmd/ips.txt，两段并行约1-3分钟）
 bash scripts/bmd.sh probe              # 全量网段1MB粗筛(并发8) + 前16名8MB精测(并发4)

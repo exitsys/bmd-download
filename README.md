@@ -35,6 +35,10 @@ bash scripts/bmd.sh download studio windows
 # 其他常用法
 bash scripts/bmd.sh link studio windows     # 只拿直链(打印URL/大小/有效期), 可粘到 IDM/浏览器
 bash scripts/bmd.sh link studio mac         # macOS 版
+bash scripts/bmd.sh list                    # 列出 BMD 全系产品线(39条)
+bash scripts/bmd.sh versions desktop-video windows  # 查某产品全部版本历史
+bash scripts/bmd.sh download desktop-video windows  # 下 BMD 全系软件(驱动/固件/Fusion/ATEM/SDK)
+bash scripts/bmd.sh download desktop-video@16.3 windows  # 指定历史版本(回退旧驱动)
 bash scripts/bmd.sh probe                   # CloudFront 优选测速(两段并行约1-3分钟)
 bash scripts/bmd.sh probe --quick           # 只重测已知可用节点(约半分钟)
 bash scripts/bmd.sh help                    # 完整帮助
@@ -108,8 +112,8 @@ git clone https://github.com/exitsys/bmd-download.git .agents/skills/bmd-downloa
 **Q: 没有代理能用吗？**
 能。海外/未被降级的网络直接 https 直连；国内无代理时自动回落 http 明文直连换链（BMD 对大陆 IP 强制降级，属官方边缘行为，非故障）。明文通道理论上可被篡改，脚本已强制校验返回直链的域名（`*.blackmagicdesign.com`）、下载完成后做 zip CRC 全量校验，并打印告警；该模式下签名直链按 http 协议签名、无法升级 https（改写协议即 404）。介意请配置 `BMD_PROXY`——有代理时换链走 https，下载文件本身则永远直连 CDN。
 
-**Q: 想下其它 Blackmagic 产品？**
-`latest-version` 接口按 product 查询，改 `get_link` 里的产品名（如 `davinci-resolve`）即可扩展。
+**Q: 想下其它 Blackmagic 软件（驱动/固件/Fusion/ATEM/SDK）？**
+直接支持：`list` 列产品线 → `versions` 查版本 → `download <产品键> <平台> [@版本]` 下载（官网全目录 1200+ 条目通用，含任意历史版本回退）。仅少数标记"需注册表单"的条目不支持（如免费版达芬奇），脚本会明确提示。
 
 ## 声明
 

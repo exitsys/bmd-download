@@ -5,7 +5,7 @@
 # 用法: bash bmd.sh link|download|probe ...  (详见 README.md 或 bmd.sh help)
 set -u
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 CACHE="$HOME/.bmd"; mkdir -p "$CACHE"
 PY=""   # 探测可用的python(跳过Windows商店stub, 它无输出)
@@ -27,25 +27,34 @@ load_edges() { # $1=目标数组名; 从 ips.txt 读前5个IP (不用mapfile, �
 
 usage() {
   cat <<'EOF'
-bmd.sh — Blackmagic 官网大文件下载一体化工具 v1.0.0
+bmd.sh — Blackmagic 官网大文件下载一体化工具 v1.1.0
 
 用法:
-  bmd.sh link <studio|free> <windows|winarm|mac|linux>
+  bmd.sh link <产品> <windows|winarm|mac|linux>
       查最新版本并换取直链, 打印 URL/大小/有效期 (可粘到 IDM/FDM/浏览器)
-  bmd.sh download <studio|free> <windows|winarm|mac|linux> [保存目录] [--no-probe|--probe]
+  bmd.sh download <产品> <windows|winarm|mac|linux> [保存目录] [--no-probe|--probe]
       全自动下载: 换链 → 优选节点 → 断点续传 → 自动换链/换节点 → zip CRC 校验
       --no-probe  跳过优选测速, 用默认 DNS
       --probe     强制重新优选(忽略缓存; 海外直连型网络默认跳过优选, 用它强制)
+  bmd.sh list
+      列出官网全目录产品线 (BMD全系: 达芬奇/驱动/固件/Fusion/ATEM/SDK等39条线)
+  bmd.sh versions <产品键> [平台]
+      按新到旧列出该产品的所有版本 (含需注册标记)
   bmd.sh probe [--quick]
       CloudFront 优选测速, 两段并行(粗筛1MB×并发8 → 前16精测8MB×并发4)
       全量约1-3分钟, --quick 只重测已知节点约半分钟
       结果存 ~/.bmd/ips.txt, 12小时内自动复用
 
+产品键:
+  studio | free                    达芬奇(最新版, 走快捷接口)
+  <目录产品键>                      其它BMD软件(走官网全目录), 如 desktop-video / fusion-studio / camera / atem
+  <目录产品键>@<版本>               指定历史版本, 如 desktop-video@16.3 (版本号见 versions 输出)
+
 环境变量:
   BMD_PROXY=socks5h://127.0.0.1:10808   手动指定访问官网API用的代理(仅API, 下载永远直连)
   BMD_LIMIT=2097152                     测试模式: 只下载前N字节
 
-缓存目录 ~/.bmd/: 直链(自动按有效期复用) / 优选IP排名 / 代理探测结果
+缓存目录 ~/.bmd/: 直链(自动按有效期复用) / 目录(12h) / 优选IP排名 / 代理探测结果
 EOF
 }
 
@@ -118,42 +127,106 @@ sess() { # 官网WAF要求: POST register 前先访问页面拿会话cookie
 }
 
 # ---------- 换直链(带缓存+限流退避) ----------
-get_link() { # get_link <studio|free> <platform>  → stdout: URL
-  local key=$1 plat=$2 prod
-  case "$key" in
-    studio) prod="davinci-resolve-studio" ;;
-    free)   prod="davinci-resolve" ;;
-    *) return 1 ;;
-  esac
-  local ver; ver=$(apicall POST /api/support/latest-version "{\"product\":\"$prod\",\"platform\":\"$plat\"}")
-  if [ -z "$ver" ] || [ "$ver" = "PROXY_FAIL" ]; then log "官网API不可达(代理探测失败), 可设 BMD_PROXY=socks5h://ip:端口 重试"; return 1; fi
-  local did; did=$(echo "$ver" | "$PY" -c "import sys,json;d=(json.load(sys.stdin).get('$plat') or {});print(d.get('downloadId',''))" 2>/dev/null)
-  if [ -z "$did" ]; then log "查最新版本失败: $(echo "$ver" | head -c 80)"; return 1; fi
-  local vinfo; vinfo=$(echo "$ver" | "$PY" -c "import sys,json;d=(json.load(sys.stdin).get('$plat') or {});print('%s.%s b%s'%(d.get('major','?'),d.get('minor','?'),d.get('build','?')))" 2>/dev/null)
-  log "最新版本: $key $vinfo ($plat)"
-  local f="$CACHE/url_$did" u exp now
+reg_link() { # $1=downloadId → stdout: 签名直链 (缓存复用+限流退避+域名校验)
+  local did=$1 f="$CACHE/url_$did" u exp now i
   if [ -s "$f" ]; then  # 未过期(>10分钟)的链接直接复用, 省限流额度
     u=$(cat "$f"); exp=$(echo "$u" | sed 's/.*Expires=//' | tr -dc '0-9'); now=$(date +%s)
-    if [ -n "$exp" ] && [ "$exp" -gt $((now+600)) ]; then echo "$u"; return; fi
+    if [ -n "$exp" ] && [ "$exp" -gt $((now+600)) ]; then echo "$u"; return 0; fi
   fi
-  local i
   for i in 1 2 3; do
     sess
     u=$(apicall POST "/api/register/us/download/$did" '{"country":"US","origin":"www.blackmagicdesign.com"}')
     if echo "$u" | grep -q '^https\?://'; then
-      # http路由下register回显http签名直链: CloudFront签名按协议生成, 改写成https会404(实测), 只能原样使用
-      case "$u" in  # http明文路由下换链响应可能被篡改, 强制校验直链域名
-        https://*.blackmagicdesign.com/*|http://*.blackmagicdesign.com/*) ;;
-        *) log "换链返回的直链域名异常, 拒绝使用: $(echo "$u" | head -c 60)"; return 1 ;;
+      # http明文路由下换链响应可能被篡改, 强制校验直链域名
+      case "$u" in
+        https://*.blackmagicdesign.com/*|http://*.blackmagicdesign.com/*) echo "$u" > "$f"; echo "$u"; return 0 ;;
       esac
-      echo "$u" > "$f"; echo "$u"; return; fi
+      log "换链返回的直链域名异常, 拒绝使用: $(echo "$u" | head -c 60)"; return 1
+    fi
     if echo "$u" | grep -q 'Must register'; then
-      log "免费版需要完整注册表单, 本脚本只支持 Studio 免表单流程; 免费版请去官网页面下载"; return 1
+      log "该下载项需要完整注册表单, 本脚本只支持免表单项(Studio/驱动/固件等); 请去官网页面下载"; return 1
     fi
     log "换链接失败(第${i}次): $(echo "$u" | head -c 60)  (持续403=限流, 每小时约3次/IP)"
     sleep $((i*20))
   done
   return 1
+}
+
+# ---------- 官网全目录 (BMD 全系软件: 驱动/固件/Fusion/ATEM/SDK 等) ----------
+fetch_catalog() { # → $CACHE/catalog.json, 缓存12小时
+  local f="$CACHE/catalog.json" ts
+  if [ -s "$f" ]; then
+    ts=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
+    [ $(( $(date +%s) - ${ts:-0} )) -lt 43200 ] && return 0
+  fi
+  apicall GET "/api/support/us/downloads.json" > "$f" 2>/dev/null && [ -s "$f" ] && return 0
+  log "拉取官网目录失败"; return 1
+}
+
+catalog_pick() { # $1=产品 $2=平台 $3=版本(可空) → stdout: "downloadId|名称|是否需注册"; 未匹配返回1
+  fetch_catalog || return 1
+  local out rc
+  out=$("$PY" -c "
+import json, sys
+prod, plat, ver = sys.argv[2], sys.argv[3], sys.argv[4]
+CAT = {'windows':'Windows','winarm':'Windows ARM','mac':'Mac OS X','linux':'Linux'}
+plat = CAT.get(plat, plat)
+d = json.load(open(sys.argv[1], encoding='utf-8'))
+cand = []
+for it in d['downloads']:
+    platmap = it.get('urls') or {}
+    pools = [platmap[plat]] if plat and plat in platmap else (list(platmap.values()) if not plat else [])
+    did = ''
+    for urls in pools:
+        for u in urls or []:
+            if u.get('product') == prod:
+                did = u.get('downloadId',''); break
+        if did: break
+    if not did: continue
+    if ver and ver not in (it.get('name') or '').split() and ver not in (it.get('downloadTitle','') or it.get('name') or ''):
+        continue
+    cand.append((it.get('numericDate') or 0, it.get('name') or '?', bool(it.get('requiresRegistration')), did))
+if not cand: sys.exit(3)
+cand.sort(key=lambda r: -r[0])
+_, name, reg, did = cand[0]
+print('%s|%s|%s' % (did, name, 'REG' if reg else 'FREE'))" "$CACHE/catalog.json" "$1" "$2" "${3:-}" 2>/dev/null)
+  rc=$?
+  if [ $rc -eq 3 ] || [ -z "$out" ]; then
+    log "目录中未匹配到: $1 $2 ${3:+(版本 $3)}"
+    log "用 bmd.sh versions $1 $2 查看可用版本; 注意 studio/free 之外的产品键用 bmd.sh list 查"
+    return 1
+  fi
+  echo "$out"
+}
+
+get_link() { # get_link <product> <platform>  → stdout: URL
+  # 产品键支持 产品@版本号 (如 desktop-video@16.3) 精确选历史版本
+  local key=$1 plat=$2 prod ver
+  prod="${key%%@*}"; ver="${key#*@}"; [ "$ver" = "$key" ] && ver=""
+  local did=""
+  if [ "$prod" = studio ] || [ "$prod" = free ]; then
+    local prodname
+    case "$prod" in
+      studio) prodname="davinci-resolve-studio" ;;
+      free)   prodname="davinci-resolve" ;;
+    esac
+    local vj; vj=$(apicall POST /api/support/latest-version "{\"product\":\"$prodname\",\"platform\":\"$plat\"}")
+    [ -n "$vj" ] && [ "$vj" != "PROXY_FAIL" ] || { log "官网API不可达(代理探测失败), 可设 BMD_PROXY=socks5h://ip:端口 重试"; return 1; }
+    did=$(echo "$vj" | "$PY" -c "import sys,json;d=(json.load(sys.stdin).get('$plat') or {});print(d.get('downloadId',''))" 2>/dev/null)
+    [ -n "$did" ] || { log "查最新版本失败: $(echo "$vj" | head -c 80)"; return 1; }
+    log "最新版本: $key $(echo "$vj" | "$PY" -c "import sys,json;d=(json.load(sys.stdin).get('$plat') or {});print('%s.%s b%s'%(d.get('major','?'),d.get('minor','?'),d.get('build','?')))" 2>/dev/null) ($plat)"
+  else
+    local pick; pick=$(catalog_pick "$prod" "$plat" "$ver") || return 1
+    did="${pick%%|*}"
+    local rest="${pick#*|}"
+    local reg="${rest##*|}"
+    local name="${rest%|*}"
+    if [ "$reg" = "REG" ]; then
+      log "$name 需要完整注册表单, 本脚本只支持免表单项(Studio/驱动/固件等); 请去官网页面下载"; return 1
+    fi
+    log "目标: $name ($plat)"
+  fi
+  reg_link "$did"
 }
 
 # ---------- CloudFront 优选 ----------
@@ -230,6 +303,56 @@ print('\n'.join(ips))" "$CACHE/cfips.json" | tr -d '\r' > "$CACHE/cand.txt"  # W
       'BEGIN{print "# "ts" "d} $2==206 && $3>0 {print $1, $3}' "$src" | sort -k2 -rn > "$CACHE/ips.txt"
   log "优选完成, 可用节点 $(($(wc -l < "$CACHE/ips.txt")-1)) 个, Top5:"
   sed -n '2,6p' "$CACHE/ips.txt" | awk '{printf "  %-16s %6.2f MB/s\n", $1, $2/1048576}'
+}
+
+# ---------- 目录查询子命令 ----------
+cmd_list() { # list: 列出官网全目录的产品线
+  fetch_catalog || return 1
+  "$PY" -c "
+import json, sys
+d = json.load(open(sys.argv[1], encoding='utf-8'))
+prods = {}
+for it in d['downloads']:
+    for urls in (it.get('urls') or {}).values():
+        for u in urls or []:
+            e = prods.setdefault(u.get('product','?'), [0, False])
+            e[0] += 1
+            e[1] = e[1] or bool(it.get('requiresRegistration'))
+print('%-30s %6s  %s' % ('产品键','下载项',''))
+for k in sorted(prods):
+    n, reg = prods[k]
+    print('%-30s %6d  %s' % (k, n, '(部分版本需注册表单)' if reg else ''))
+print()
+print('查看版本: bmd.sh versions <产品键> [平台]   下载: bmd.sh download <产品键> <平台> [@版本见versions]')" "$CACHE/catalog.json"
+}
+
+cmd_versions() { # versions <产品键> [平台]: 按新到旧列版本
+  fetch_catalog || return 1
+  "$PY" -c "
+import json, sys
+prod = sys.argv[2]
+CAT = {'windows':'Windows','winarm':'Windows ARM','mac':'Mac OS X','linux':'Linux'}
+plat = CAT.get(sys.argv[3], sys.argv[3]) if len(sys.argv) > 3 else ''
+d = json.load(open(sys.argv[1], encoding='utf-8'))
+rows = {}
+for it in d['downloads']:
+    platmap = it.get('urls') or {}
+    pools = [platmap[plat]] if plat and plat in platmap else (list(platmap.values()) if not plat else [])
+    hit = False
+    for urls in pools:
+        for u in urls or []:
+            if u.get('product') == prod: hit = True; break
+        if hit: break
+    if not hit: continue
+    key = it.get('name') or '?'
+    e = rows.setdefault(key, [it.get('numericDate') or 0, it.get('date') or '', bool(it.get('requiresRegistration'))])
+    e[0] = max(e[0], it.get('numericDate') or 0)
+if not rows:
+    print('未找到产品: %s  (产品键用 bmd.sh list 查)' % prod, file=sys.stderr); sys.exit(1)
+print('%-14s %-52s %s' % ('日期','版本',''))
+for name in sorted(rows, key=lambda k: -rows[k][0]):
+    _, dt, reg = rows[name]
+    print('%-14s %-52s %s' % (dt, name, '[需注册表单]' if reg else ''))" "$CACHE/catalog.json" "$1" "${2:-}"
 }
 
 # ---------- 下载 ----------
@@ -334,6 +457,8 @@ case "${1:-}" in
   link)     shift; cmd_link "${1:-studio}" "${2:-windows}" ;;
   download) shift; cmd_download "${1:-studio}" "${2:-windows}" "${3:-.}" ;;
   probe)    shift; probe "${1:-}" ;;
+  list)     cmd_list ;;
+  versions) shift; cmd_versions "${1:?用法: versions <产品键> [平台]}" "${2:-}" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 1 ;;
 esac

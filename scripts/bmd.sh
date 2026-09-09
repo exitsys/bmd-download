@@ -73,10 +73,11 @@ find_proxy() { # → stdout: 路由token(direct|direct-http|代理URL); 全部�
   [ -s "$CACHE/proxy" ] && cached=$(cat "$CACHE/proxy")
   if [ -n "$cached" ] && want_test "$cached"; then echo "$cached"; return; fi
   local p
-  for p in "${BMD_PROXY:-}" direct direct-http \
+  # direct-http(http明文)放最末: 仅当代理与https直连全部不可用时才回落, 避免有可用代理的用户被静默降级成明文
+  for p in "${BMD_PROXY:-}" direct \
            "socks5h://127.0.0.1:7890" "socks5h://127.0.0.1:7897" \
            "socks5h://127.0.0.1:10808" "socks5h://127.0.0.1:10809" "socks5h://127.0.0.1:1080" \
-           "${ALL_PROXY:-}" "${https_proxy:-}"; do
+           "${ALL_PROXY:-}" "${https_proxy:-}" direct-http; do
     [ -n "$p" ] || continue
     if want_test "$p"; then echo "$p" > "$CACHE/proxy"; echo "$p"; return; fi
   done
@@ -165,7 +166,8 @@ edges_fresh() { # ~/.bmd/ips.txt 存在、有可用节点且 <12h → 真
 
 probe_one() { # $1=IP $2=样本字节 $3=最长秒 $4=结果文件 → 追加 "ip code speed" 行(并发调用)
   local r
-  r=$(curl -s --noproxy '*' --resolve "$DLHOST:443:$1" -r $POFF-$((POFF+$2-1)) -o /dev/null \
+  # 双端口注册: http直链(80)与https直链(443)下 --resolve 都能命中, 否则 http URL 时固定无效、测的是随机DNS边缘
+  r=$(curl -s --noproxy '*' --resolve "$DLHOST:443:$1" --resolve "$DLHOST:80:$1" -r $POFF-$((POFF+$2-1)) -o /dev/null \
       -w '%{http_code} %{speed_download}' --max-time "$3" -A "$UA" "$PURL" 2>/dev/null)
   echo "$1 $r" >> "$4"
 }
@@ -286,7 +288,7 @@ print('CRC_OK' if bad is None else 'CRC_BAD:'+bad)")
     tries=$((tries+1)); [ $tries -gt 2000 ] && { log "重试次数用尽, 重跑本命令可续传"; return 1; }
     local res=() range=(-C -)
     [ -n "${BMD_LIMIT:-}" ] && range=(-r 0-$((BMD_LIMIT-1)))   # 测试模式: 只要前N字节
-    [ ${#edges[@]} -gt 0 ] && res=(--resolve "$DLHOST:443:${edges[$ei]}")
+    [ ${#edges[@]} -gt 0 ] && res=(--resolve "$DLHOST:443:${edges[$ei]}" --resolve "$DLHOST:80:${edges[$ei]}")  # 双端口: http直链也钉得住
     log "try=$tries 已下 $((size/1024/1024))MB/$((expected/1024/1024))MB ($(awk "BEGIN{printf \"%.1f%%\", $size*100/$expected}")) 节点=${edges[$ei]:-默认DNS}"
     local http; http=$(curl -sfL --noproxy '*' "${range[@]}" -o "$outdir/$fname" --connect-timeout 15 \
         --speed-time 45 --speed-limit 102400 -A "$UA" ${res[@]+"${res[@]}"} \

@@ -40,6 +40,12 @@ bash scripts/bmd.sh probe --quick           # 只重测已知可用节点(约半
 bash scripts/bmd.sh help                    # 完整帮助
 ```
 
+**海外服务器**用零依赖单文件版更省事（最新版 Studio Windows，断点续传 + 完成后大小与 zip CRC 校验；国内机器加 `BMD_PROXY=socks5h://ip:端口` 也可用）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/exitsys/bmd-download/main/scripts/bmd-server-dl.sh | bash
+```
+
 `download` 一条命令到底：查最新版本 → 换直链 → 优选节点（两段并行约 1-3 分钟，结果缓存 12 小时；API 可 https 直连的海外型网络自动跳过，`--probe` 可强制）→ 断点续传 → 链接过期自动换 → 速度不佳自动轮换节点 → 下载完成自动做 zip CRC 校验。中断后**重跑同一条命令即续传**。
 
 ## 工作原理

@@ -94,7 +94,7 @@ git clone https://github.com/exitsys/bmd-download.git .agents/skills/bmd-downloa
 限流了，等 1 小时，或换网络出口（手机热点等）。
 
 **Q: probe 大量节点显示连不上（000）？**
-正常。多数区域边缘节点从国内不可达，看排上名的即可。
+正常。多数区域边缘节点从国内不可达，看排上名的即可。但若**全部** 000 且一分钟内就"测完"，不是网络问题——是候选列表/参数层错误（典型：Windows Git Bash 下 Python 文本输出 CRLF，IP 带 `\r` 拼进 `--resolve` 使 curl 秒败），检查 `~/.bmd/cand.txt` 行尾。
 
 **Q: 校验失败怎么办？**
 删除残留的 zip 重跑，断点续传不会自动修复坏块。

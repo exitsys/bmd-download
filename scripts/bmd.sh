@@ -119,8 +119,9 @@ get_link() { # get_link <studio|free> <platform>  → stdout: URL
 }
 
 # ---------- CloudFront 优选 ----------
-edges_fresh() { # ~/.bmd/ips.txt 存在且 <12h → 真
+edges_fresh() { # ~/.bmd/ips.txt 存在、有可用节点且 <12h → 真
   [ -s "$CACHE/ips.txt" ] || return 1
+  [ "$(grep -c -v '^#' "$CACHE/ips.txt")" -ge 1 ] || return 1  # 优选全灭只剩表头不算有效缓存, 否则会跳过重测12h
   local ts; ts=$(awk 'NR==1{print $2}' "$CACHE/ips.txt" 2>/dev/null)
   [ -n "$ts" ] && [ $(( $(date +%s) - ts )) -lt 43200 ]
 }
@@ -142,7 +143,7 @@ for r in ranges:
     p16 = first.rsplit('.', 2)[0]
     if p16 not in seen:
         seen.add(p16); ips.append(first)
-print('\n'.join(ips))" "$CACHE/cfips.json" > "$CACHE/cand.txt"
+print('\n'.join(ips))" "$CACHE/cfips.json" | tr -d '\r' > "$CACHE/cand.txt"  # Windows python文本输出是CRLF, \r带入--resolve会让curl秒败
   if $quick && [ -s "$CACHE/ips.txt" ]; then  # quick: 只重测上次的可用节点
     awk '!/^#/{print $1}' "$CACHE/ips.txt" > "$CACHE/cand.txt"
   fi
@@ -152,6 +153,7 @@ print('\n'.join(ips))" "$CACHE/cfips.json" > "$CACHE/cand.txt"
   : > "$CACHE/ips.raw"
   local n=0 total r; total=$(wc -l < "$CACHE/cand.txt")
   while read -r ip; do
+    ip=${ip%$'\r'}   # 双保险: 兜底剥掉可能残留的CR
     n=$((n+1))
     r=$(curl -s --resolve "$DLHOST:443:$ip" -r $off-$((off+2097151)) -o /dev/null \
         -w '%{http_code} %{speed_download}' --max-time 8 -A "$UA" "$url" 2>/dev/null)
@@ -195,11 +197,13 @@ cmd_download() { # download <studio|free> <platform> [outdir] [--no-probe]
         local zpath="$outdir/$fname"
         command -v cygpath >/dev/null 2>&1 && zpath=$(cygpath -w "$zpath")  # env变量不做MSYS自动转换,需手动转Windows路径
         log "zip CRC 校验中(9-10GB约需1-3分钟)..."
-        if BMD_ZIP="$zpath" "$PY" -c "
+        local crc; crc=$(BMD_ZIP="$zpath" "$PY" -c "
 import os, zipfile
 p = os.environ['BMD_ZIP']
 bad = zipfile.ZipFile(p).testzip()
-print('CRC_OK' if bad is None else 'CRC_BAD:'+bad)" | tee /dev/stderr | grep -q CRC_OK; then
+print('CRC_OK' if bad is None else 'CRC_BAD:'+bad)")
+        log "CRC: $crc"
+        if [ "$crc" = CRC_OK ]; then
           log "✅ 校验通过, 文件完好: $outdir/$fname"
         else
           log "❌ CRC校验失败! 删除残文件重跑"; return 1

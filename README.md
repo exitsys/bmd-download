@@ -39,6 +39,7 @@ bash scripts/bmd.sh list                    # 列出 BMD 全系产品线(39条)
 bash scripts/bmd.sh versions desktop-video windows  # 查某产品全部版本历史
 bash scripts/bmd.sh download desktop-video windows  # 下 BMD 全系软件(驱动/固件/Fusion/ATEM/SDK)
 bash scripts/bmd.sh download desktop-video@16.3 windows  # 指定历史版本(回退旧驱动)
+bash scripts/bmd.sh download studio windows --parallel   # 全网段拥堵时的分块并行模式
 bash scripts/bmd.sh probe                   # CloudFront 优选测速(两段并行约1-3分钟)
 bash scripts/bmd.sh probe --quick           # 只重测已知可用节点(约半分钟)
 bash scripts/bmd.sh help                    # 完整帮助
@@ -78,6 +79,7 @@ CloudFront 全球边缘节点共享同一批 IP 段，节点靠 TLS SNI 区分�
 - **限流退避**：换链 403 自动指数退避重试，并提示等待窗口
 - **代理自动探测与路由**：只用于访问官网 API（实测 BMD **自家边缘**对大陆来源 IP 全站 301 强制降级 https→http——TLS 对端持 DigiCert 签发的 `*.blackmagicdesign.com` 真证书，并非运营商劫持；降级后 80 端口服务完好），依次尝试 `BMD_PROXY` → https 直连 → 常见本地代理端口（7890/7897/10808/10809/1080）→ 环境变量代理 → **http 明文直连回落**（无任何代理也能换链，打印告警并强制校验直链域名 `*.blackmagicdesign.com`）；**下载文件本身永远直连 CDN**。所有 curl 均以 `--noproxy` 显式钉死代理行为，免疫 `NO_PROXY`/`https_proxy` 等代理环境变量干扰（curl 的 `NO_PROXY` 优先级高于显式 `-x`，不钉死时设了 `NO_PROXY=*` 的 shell 里代理探测会全部静默失效）
 - **卡速自动换节点**：45 秒低于 100KB/s 判定卡速，自动轮换到下一个优选节点；连续断流自动重测优选（手里没有优选节点时 2 次即触发）；API 可 https 直连（海外型）的网络默认跳过前置优选，`download --probe` 可强制
+- **全网段拥堵模式（分块并行）**：实测晚高峰所有边缘节点单路径都被限速（0.1-0.5MB/s），但不同节点的路径带宽互相独立——连续 3 次卡速自动切入（或 `--parallel[=N]` 强制）：64MB 分块 × N worker 各钉一个节点并行下载，吞吐实测 5.7 倍；块级断点续传、旧残档前缀自动回收、带锁换链防限流、缺块自动重扫并重测优选、拼接后完整校验
 
 ## 作为 AI Agent Skill 安装
 

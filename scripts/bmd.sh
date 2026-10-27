@@ -5,7 +5,7 @@
 # 用法: bash bmd.sh link|download|probe ...  (详见 README.md 或 bmd.sh help)
 set -u
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 CACHE="$HOME/.bmd"; mkdir -p "$CACHE"
 PY=""   # 探测可用的python(跳过Windows商店stub, 它无输出)
@@ -32,10 +32,12 @@ bmd.sh — Blackmagic 官网大文件下载一体化工具 v1.1.0
 用法:
   bmd.sh link <产品> <windows|winarm|mac|linux>
       查最新版本并换取直链, 打印 URL/大小/有效期 (可粘到 IDM/FDM/浏览器)
-  bmd.sh download <产品> <windows|winarm|mac|linux> [保存目录] [--no-probe|--probe]
+  bmd.sh download <产品> <windows|winarm|mac|linux> [保存目录] [--no-probe|--probe] [--parallel[=N]]
       全自动下载: 换链 → 优选节点 → 断点续传 → 自动换链/换节点 → zip CRC 校验
-      --no-probe  跳过优选测速, 用默认 DNS
-      --probe     强制重新优选(忽略缓存; 海外直连型网络默认跳过优选, 用它强制)
+      --no-probe   跳过优选测速, 用默认 DNS
+      --probe      强制重新优选(忽略缓存; 海外直连型网络默认跳过优选, 用它强制)
+      --parallel[=N]  强制分块并行模式(N=worker数, 默认6): 全网段拥堵时各边缘路径
+                   带宽独立可叠加, 64MB分块×N节点并行; 连续3次卡速也会自动切入
   bmd.sh list
       列出官网全目录产品线 (BMD全系: 达芬奇/驱动/固件/Fusion/ATEM/SDK等39条线)
   bmd.sh versions <产品键> [平台]
@@ -53,6 +55,7 @@ bmd.sh — Blackmagic 官网大文件下载一体化工具 v1.1.0
 环境变量:
   BMD_PROXY=socks5h://127.0.0.1:10808   手动指定访问官网API用的代理(仅API, 下载永远直连)
   BMD_LIMIT=2097152                     测试模式: 只下载前N字节
+  BMD_CHUNK=8388608                     并行模式的分块大小(默认64MB)
 
 缓存目录 ~/.bmd/: 直链(自动按有效期复用) / 目录(12h) / 优选IP排名 / 代理探测结果
 EOF
@@ -356,10 +359,155 @@ for name in sorted(rows, key=lambda k: -rows[k][0]):
 }
 
 # ---------- 下载 ----------
-cmd_download() { # download <studio|free> <platform> [outdir] [--no-probe|--probe]
-  local key=$1 plat=$2 outdir="." noprobe=false forceprobe=false a
+# ---------- zip 校验(单线程/并行两条路径共用) ----------
+verify_zip() { # $1=文件路径(Git Bash路径) → 0=CRC通过; 非.zip或BMD_LIMIT模式直接通过
+  [ -z "${BMD_LIMIT:-}" ] || return 0
+  [[ "$1" == *.zip ]] || return 0
+  local zpath="$1"
+  command -v cygpath >/dev/null 2>&1 && zpath=$(cygpath -w "$zpath")  # env变量不做MSYS自动转换,需手动转Windows路径
+  log "zip CRC 校验中(9-10GB约需1-3分钟)..."
+  local crc; crc=$(BMD_ZIP="$zpath" "$PY" -c "
+import os, zipfile
+p = os.environ['BMD_ZIP']
+bad = zipfile.ZipFile(p).testzip()
+print('CRC_OK' if bad is None else 'CRC_BAD:'+bad)")
+  log "CRC: $crc"
+  [ "$crc" = "CRC_OK" ]
+}
+
+# ---------- 分块并行下载(全网段拥堵模式) ----------
+# 2026-10-28 实测: 晚高峰所有边缘节点单路径都被限到 0.1-0.5MB/s, 但不同节点的路径
+# 带宽互相独立 —— 6 worker 各钉一个节点按 64MB 分块下载, 总吞吐可线性叠加(实测 5.7x)。
+# 块级断点续传 + 旧单线程残档前缀回收 + 带锁换链(防多worker同时触发限流) + 缺块重扫。
+pd_renew() { # 带锁换链: 并发 worker 只有一个真正调用, 其余等待后重读
+  local lock="$CACHE/renew.lock" waited=0
+  until mkdir "$lock" 2>/dev/null; do
+    # 超过120s的锁视为残留(进程被杀), 强制接管
+    [ $(( $(date +%s) - $(stat -c %Y "$lock" 2>/dev/null || echo 0) )) -gt 120 ] && { rm -rf "$lock"; continue; }
+    sleep 5; waited=$((waited+5)); [ $waited -ge 90 ] && return 1
+  done
+  bash "$0" link "$1" "$2" 2>/dev/null | grep -m1 '^https\?://' > "$CACHE/pd_url"
+  rm -rf "$lock"
+  grep -q '^https\?://' "$CACHE/pd_url"
+}
+
+pd_worker() { # $1=worker编号: 轮到自己名下的块, 逐块下载(块级续传)
+  local w=$1 idx start want p tmp edge tries rc
+  for (( idx=w; idx<pd_total; idx+=pd_nwork )); do
+    p="$pd_parts/part_$(printf '%04d' $idx)"
+    want=$pd_chunk; [ $(( (idx+1)*pd_chunk )) -gt $pd_expected ] && want=$(( pd_expected - idx*pd_chunk ))
+    [ -s "$p" ] && [ "$(fsize "$p")" = "$want" ] && continue
+    start=$(( idx*pd_chunk ))
+    for tries in 1 2 3 4 5 6; do
+      edge=${pd_edges[$(( (idx+tries) % ${#pd_edges[@]} ))]}
+      local res=()
+      [ -n "$edge" ] && res=(--resolve "$DLHOST:443:$edge" --resolve "$DLHOST:80:$edge")  # 双端口: http直链也钉得住
+      tmp="$p.tmp.$$"
+      curl -sf ${res[@]+"${res[@]}"} -r $start-$(( start+want-1 )) -o "$tmp" \
+           --connect-timeout 15 --speed-time 45 --speed-limit 20480 -A "$UA" \
+           "$(cat "$CACHE/pd_url")" 2>/dev/null
+      rc=$?
+      if [ "$(fsize "$tmp")" = "$want" ]; then mv "$tmp" "$p"; break; fi
+      rm -f "$tmp"
+      if [ $rc -eq 22 ]; then
+        log "p-w$w 块$idx HTTP错误(可能链接过期), 带锁换链..."
+        pd_renew "$pd_key" "$pd_plat" || sleep 30
+      else
+        sleep $(( tries*2 ))
+      fi
+    done
+  done
+}
+
+parallel_download() { # <key> <plat> <url> <outdir> <fname> <expected> <workers> → 0=完整成功
+  pd_key=$1; pd_plat=$2; pd_url=$3; pd_outdir=$4; pd_fname=$5; pd_expected=$6
+  pd_chunk=${BMD_CHUNK:-67108864}   # 64MB/块, 测试可用 BMD_CHUNK=8388608
+  pd_nwork=$7
+  pd_edges=(); load_edges pd_edges   # worker 子进程共享此全局节点表
+  [ ${#pd_edges[@]} -ge 2 ] || { log "并行模式需要>=2个优选节点, 当前不足"; return 1; }
+  pd_parts="$pd_outdir/.parts_$pd_fname"
+  mkdir -p "$pd_parts" || return 1
+  find "$pd_parts" -name '*.tmp.*' -delete 2>/dev/null   # 清理上次被杀进程的残tmp
+  pd_total=$(( (pd_expected + pd_chunk - 1) / pd_chunk ))
+  log "并行模式: $pd_total 块 × $((pd_chunk/1024/1024))MB, $pd_nwork worker, 节点轮换"
+  echo "$pd_url" > "$CACHE/pd_url"
+
+  # 旧单线程残档前缀回收(仅当残档小于目标且还没有任何完整块, 避免误切已拼装文件)
+  local oldsz; oldsz=$(fsize "$pd_outdir/$pd_fname")
+  if [ "$oldsz" -gt 0 ] && [ "$oldsz" -lt "$pd_expected" ]; then
+    local ncomplete; ncomplete=$(find "$pd_parts" -name 'part_[0-9]*' | wc -l)
+    if [ "$ncomplete" -eq 0 ]; then
+      local k seed p want
+      seed=$(( oldsz / pd_chunk )); [ $seed -gt $pd_total ] && seed=$pd_total
+      for (( k=0; k<seed; k++ )); do
+        p="$pd_parts/part_$(printf '%04d' $k)"
+        want=$pd_chunk; [ $(( (k+1)*pd_chunk )) -gt $pd_expected ] && want=$(( pd_expected - k*pd_chunk ))
+        [ -s "$p" ] && [ "$(fsize "$p")" = "$want" ] && continue
+        dd if="$pd_outdir/$pd_fname" of="$p" bs=$pd_chunk skip=$(( k*pd_chunk )) count=1 iflag=skip_bytes,count_bytes 2>/dev/null
+        [ "$(fsize "$p")" = "$want" ] && log "回收旧残档块 $k" || rm -f "$p"
+      done
+      rm -f "$pd_outdir/$pd_fname"
+    fi
+  fi
+
+  # 全局重扫循环: 每轮 N worker 并行啃自己名下的块, 缺块进入下一轮
+  local round=0 missing done_n
+  while :; do
+    round=$((round+1)); [ $round -gt 12 ] && { log "并行模式轮次用尽, 分块保留在 $pd_parts"; return 1; }
+    # 第3轮起仍缺块: 深夜/时段切换节点排名会变, 重测优选并刷新节点表
+    if [ $round -ge 3 ]; then
+      missing=0
+      local idx p want
+      for (( idx=0; idx<pd_total; idx++ )); do
+        p="$pd_parts/part_$(printf '%04d' $idx)"
+        want=$pd_chunk; [ $(( (idx+1)*pd_chunk )) -gt $pd_expected ] && want=$(( pd_expected - idx*pd_chunk ))
+        [ -s "$p" ] && [ "$(fsize "$p")" = "$want" ] || { missing=1; break; }
+      done
+      if [ $missing -eq 1 ]; then
+        log "第${round}轮前缺块, 重测优选刷新节点表..."
+        probe --quick >/dev/null 2>&1 && load_edges pd_edges   # 时段切换节点排名会变
+      fi
+    fi
+    local w
+    for (( w=0; w<pd_nwork; w++ )); do pd_worker $w & done
+    wait
+    missing=0
+    local idx p want
+    for (( idx=0; idx<pd_total; idx++ )); do
+      p="$pd_parts/part_$(printf '%04d' $idx)"
+      want=$pd_chunk; [ $(( (idx+1)*pd_chunk )) -gt $pd_expected ] && want=$(( pd_expected - idx*pd_chunk ))
+      [ -s "$p" ] && [ "$(fsize "$p")" = "$want" ] || { missing=1; }
+    done
+    done_n=$(find "$pd_parts" -name 'part_[0-9]*' | wc -l)
+    [ $missing -eq 0 ] && break
+    log "第${round}轮结束: $done_n/$pd_total 块, 缺块重扫"
+    sleep 3
+  done
+
+  log "全部块齐, 拼接 $pd_total 块 → $pd_fname ..."
+  : > "$pd_outdir/$pd_fname"
+  local idx
+  for (( idx=0; idx<pd_total; idx++ )); do cat "$pd_parts/part_$(printf '%04d' $idx)" >> "$pd_outdir/$pd_fname"; done
+  local sz; sz=$(fsize "$pd_outdir/$pd_fname")
+  [ "$sz" = "$pd_expected" ] || { log "❌ 拼接后大小不符: $sz / $pd_expected (分块保留在 $pd_parts)"; return 1; }
+  log "拼接完成, 大小校验通过"
+  verify_zip "$pd_outdir/$pd_fname" || { log "❌ CRC校验失败 (分块保留在 $pd_parts 供排查)"; return 1; }
+  log "✅ 并行模式完成: $pd_outdir/$pd_fname"
+  rm -rf "$pd_parts"
+}
+
+cmd_download() { # download <studio|free> <platform> [outdir] [--no-probe|--probe|--parallel [N]]
+  local key=$1 plat=$2 outdir="." noprobe=false forceprobe=false parallel=false workers=6 a
   shift 2
-  for a in "$@"; do case "$a" in --no-probe) noprobe=true ;; --probe) forceprobe=true ;; *) outdir="$a" ;; esac; done
+  for a in "$@"; do
+    case "$a" in
+      --no-probe) noprobe=true ;;
+      --probe) forceprobe=true ;;
+      --parallel) parallel=true ;;
+      --parallel=*) parallel=true; workers="${a#--parallel=}" ;;
+      *) outdir="$a" ;;
+    esac
+  done
   # Git Bash 下 "D:/中文目录" 风格路径: MSYS stat 可能拿不到大小, 续传判断失效会从0重写文件
   # (实测踩坑)。统一转成 /d/... MSYS 风格, stat 与 原生curl(经MSYS参数转换) 都能正确处理。
   case "$outdir" in [A-Za-z]:[/\\]*) command -v cygpath >/dev/null 2>&1 && outdir=$(cygpath -u "$outdir") ;; esac
@@ -390,23 +538,19 @@ cmd_download() { # download <studio|free> <platform> [outdir] [--no-probe|--prob
     local size; size=$(fsize "$outdir/$fname")
     if [ "$size" -ge "$expected" ]; then
       log "下载完成: $size 字节"
-      if [ -z "${BMD_LIMIT:-}" ] && [[ "$fname" == *.zip ]]; then
-        local zpath="$outdir/$fname"
-        command -v cygpath >/dev/null 2>&1 && zpath=$(cygpath -w "$zpath")  # env变量不做MSYS自动转换,需手动转Windows路径
-        log "zip CRC 校验中(9-10GB约需1-3分钟)..."
-        local crc; crc=$(BMD_ZIP="$zpath" "$PY" -c "
-import os, zipfile
-p = os.environ['BMD_ZIP']
-bad = zipfile.ZipFile(p).testzip()
-print('CRC_OK' if bad is None else 'CRC_BAD:'+bad)")
-        log "CRC: $crc"
-        if [ "$crc" = CRC_OK ]; then
-          log "✅ 校验通过, 文件完好: $outdir/$fname"
-        else
-          log "❌ CRC校验失败! 删除残文件重跑"; return 1
-        fi
+      if verify_zip "$outdir/$fname"; then
+        log "✅ 校验通过, 文件完好: $outdir/$fname"
+      else
+        log "❌ CRC校验失败! 删除残文件重跑"; return 1
       fi
       return 0
+    fi
+    # 强制并行模式: 优选节点>=2个时直接进入分块并行
+    if $parallel && [ ${#edges[@]} -ge 2 ]; then
+      [ "$workers" -gt ${#edges[@]} ] && workers=${#edges[@]}   # worker 数不超过可用节点数
+      parallel_download "$key" "$plat" "$url" "$outdir" "$fname" "$expected" "$workers" && return 0
+      log "并行模式未成功, 回退单线程续传"
+      parallel=false
     fi
     tries=$((tries+1)); [ $tries -gt 2000 ] && { log "重试次数用尽, 重跑本命令可续传"; return 1; }
     local res=() range=(-C -)
@@ -426,6 +570,16 @@ print('CRC_OK' if bad is None else 'CRC_BAD:'+bad)")
       stall=$((stall+1))
       if [ ${#edges[@]} -gt 1 ]; then
         ei=$(( (ei+1) % ${#edges[@]} )); log "速度不佳, 切换节点 → ${edges[$ei]} (第${stall}次)"
+      fi
+      # 拥堵自动降级: 连续卡速且可用节点>=3 → 切分块并行(各路径带宽独立, 可叠加)
+      if [ $stall -ge 3 ] && [ ${#edges[@]} -ge 3 ] && [ "$parallel" = false ]; then
+        log "连续${stall}次卡速, 疑似全网段拥堵 → 自动切换分块并行模式"
+        local pw=${#edges[@]}; [ $pw -gt 6 ] && pw=6
+        parallel_download "$key" "$plat" "$url" "$outdir" "$fname" "$expected" "$pw" && return 0
+        log "并行模式未成功, 继续单线程轮换"
+        parallel=true   # 本次下载内不再反复触发
+        stall=0
+        continue
       fi
       local rth=6; [ ${#edges[@]} -eq 0 ] && rth=2   # 手里没有优选节点时更早触发重测
       if [ $stall -ge $rth ]; then
@@ -455,7 +609,7 @@ cmd_link() { # link <studio|free> <platform>
 
 case "${1:-}" in
   link)     shift; cmd_link "${1:-studio}" "${2:-windows}" ;;
-  download) shift; cmd_download "${1:-studio}" "${2:-windows}" "${3:-.}" ;;
+  download) shift; cmd_download "${1:-studio}" "${2:-windows}" "${@:3}" ;;
   probe)    shift; probe "${1:-}" ;;
   list)     cmd_list ;;
   versions) shift; cmd_versions "${1:?用法: versions <产品键> [平台]}" "${2:-}" ;;

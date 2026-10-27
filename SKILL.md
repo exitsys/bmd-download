@@ -36,6 +36,7 @@ bash scripts/bmd.sh list                             # 列产品线
 bash scripts/bmd.sh versions desktop-video windows   # 查版本历史(新到旧)
 bash scripts/bmd.sh download desktop-video windows   # 下最新版
 bash scripts/bmd.sh download desktop-video@16.3 windows  # 指定历史版本
+bash scripts/bmd.sh download studio windows --parallel   # 拥堵模式: 分块并行
 
 # 优选 IP 测速（存 ~/.bmd/ips.txt，两段并行约1-3分钟）
 bash scripts/bmd.sh probe              # 全量网段1MB粗筛(并发8) + 前16名8MB精测(并发4)
@@ -53,6 +54,7 @@ bash scripts/bmd.sh probe --quick      # 只重测已知节点, 约半分钟
 | API 必须带浏览器 UA + 先访问页面拿 cookie | WAF 规则，缺一个就 403/400，脚本已内置 |
 | 官网 API 要代理、下载不要代理 | BMD 自家边缘（openresty，真证书可证并非运营商劫持）对大陆 IP 全站 301 降级 https→http，80 端口服务完好；下载文件必须直连 CloudFront（走代理必慢必断）。脚本自动探测代理（env `BMD_PROXY` 可指定，如 `socks5h://127.0.0.1:10808`）；完全无代理时自动回落 http 明文换链（带告警+直链域名校验） |
 | 默认 DNS 节点晚高峰可能堵到 <50KB/s | 优选后同文件可达 16-19 MB/s；两段并行测速约 1-3 分钟，结果存 `~/.bmd/ips.txt`，超 12 小时自动重测；海外型网络（https 直连）默认跳过优选，`--probe` 强制 |
+| 晚高峰**所有**节点都堵(0.1-0.5MB/s) | 不同边缘路径带宽互相独立: 连续 3 次卡速自动切分块并行模式(64MB块×N节点, 吞吐实测5.7x), 也可 `--parallel[=N]` 强制; 完成后拼接+CRC |
 | CF 中国网段(120.52.x/180.163.x/111.13.x) | 只服务有 ICP 备案的站，BMD 没备案，连了 403，脚本已排除 |
 | 172.64.x.x 等 Cloudflare IP | 服务不了 CloudFront 的域名（证书不匹配），别拿来优选 BMD |
 | 免费版 vs Studio | Studio 走免表单的 Download Only 接口；免费版接口要求完整注册表单，本 skill 只支持 Studio 免表单流程，免费版让用户去官网页面下 |
